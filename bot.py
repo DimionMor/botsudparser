@@ -31,8 +31,8 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════════
 
-BOT_TOKEN       = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
+BOT_TOKEN       = "8760718814:AAGzC9fciHKlxnzxSdQeuy4duHaQCnU17Jo"
+TELEGRAM_CHAT_ID = "488361906"
 
 DB_PATH     = "court_monitor.db"
 CHECK_HOUR  = 11   # МСК
