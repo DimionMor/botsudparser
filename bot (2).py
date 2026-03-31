@@ -4,33 +4,35 @@
       2) Калининский районный суд СПб (kln--spb.sudrf.ru)
 Отчёт: каждый день в 11:00 МСК в TELEGRAM_CHAT_ID
 """
- 
+
 import asyncio
 import logging
 import os
 import re
 from datetime import datetime
- 
+
 import aiosqlite
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
- 
+
 # ══════════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════════
- 
-BOT_TOKEN        = "8760718814:AAGzC9fciHKlxnzxSdQeuy4duHaQCnU17Jo"
+
+BOT_TOKEN        = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
- 
+PORT             = int(os.getenv("PORT", 8080))
+
 DB_PATH    = "court_monitor.db"
 CHECK_HOUR = 11   # МСК
 CHECK_MIN  = 0
- 
+
 PERSONS = [
     {
         "id":         1,
@@ -47,21 +49,20 @@ PERSONS = [
         "birth_year": "1979",
     },
 ]
- 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger(__name__)
- 
-# Шаблон номера дела на sudrf.ru: 2-123/2026, 12-45/26, 2а-678/2025 и т.п.
+
 CASE_NUMBER_RE = re.compile(r"^\d{1,5}[а-яА-Я]?[-\u2011]\d{1,6}/\d{2,4}$")
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════
 #  БАЗА ДАННЫХ
 # ══════════════════════════════════════════════════════════════
- 
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
@@ -81,8 +82,8 @@ async def init_db():
             );
         """)
         await db.commit()
- 
- 
+
+
 async def save_new_cases(person_id: int, court_key: str, cases: list[dict]) -> list[dict]:
     new_cases = []
     async with aiosqlite.connect(DB_PATH) as db:
@@ -106,21 +107,21 @@ async def save_new_cases(person_id: int, court_key: str, cases: list[dict]) -> l
                 pass
         await db.commit()
     return new_cases
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════
 #  ПАРСЕР 1: Калининский районный суд (kln--spb.sudrf.ru)
 # ══════════════════════════════════════════════════════════════
- 
+
 KLN_BASE = "https://kln--spb.sudrf.ru/modules.php"
- 
+
 KLN_DELO_IDS = [
     ("1540005", "Гражданское"),
     ("1540006", "Административное"),
     ("1540007", "Уголовное"),
 ]
- 
- 
+
+
 async def parse_kalininskiy(last_name: str, birth_year: str,
                              session: aiohttp.ClientSession) -> list[dict]:
     results = []
@@ -132,7 +133,7 @@ async def parse_kalininskiy(last_name: str, birth_year: str,
         ),
         "Referer": "https://kln--spb.sudrf.ru/",
     }
- 
+
     for delo_id, delo_type in KLN_DELO_IDS:
         params = {
             "name":       "sud_delo",
@@ -154,77 +155,55 @@ async def parse_kalininskiy(last_name: str, birth_year: str,
             ) as resp:
                 raw = await resp.read()
                 html = raw.decode("windows-1251", errors="replace")
- 
+
             soup = BeautifulSoup(html, "html.parser")
             rows = _extract_sudrf_rows(soup, last_name)
             for r in rows:
                 r["type"] = delo_type
                 results.append(r)
- 
+
         except Exception as e:
             log.error("kln sudrf parse error (%s): %s", delo_type, e)
- 
+
         await asyncio.sleep(1)
- 
+
     log.info("Калининский суд => %s: найдено %d дел", last_name, len(results))
     return results
- 
- 
+
+
 def _is_case_number(text: str) -> bool:
-    """
-    Проверяет, что строка является номером дела.
-    Форматы: 2-123/2026, 12-45/26, 2а-678/2025, 2а-678/25
-    Дефис может быть обычным (-) или неразрывным (U+2011).
-    """
-    t = text.strip()
-    return bool(CASE_NUMBER_RE.match(t))
- 
- 
+    return bool(CASE_NUMBER_RE.match(text.strip()))
+
+
 def _extract_sudrf_rows(soup: BeautifulSoup, search_name: str) -> list[dict]:
-    """
-    Парсит таблицу результатов поиска на сайтах *.sudrf.ru.
- 
-    Стратегия: ищем ячейки TD, текст которых совпадает с шаблоном
-    номера дела (N-NNN/YYYY). Это надёжнее чем искать по ссылкам,
-    потому что у разных судов разные параметры в href.
- 
-    Дополнительная проверка: строка должна содержать фамилию искомого
-    человека (регистронезависимо) — это отсекает любые посторонние строки.
-    """
     cases = []
     search_name_lower = search_name.lower()
- 
-    # Берём все строки всех таблиц
+
     for row in soup.find_all("tr"):
         cols = row.find_all("td")
         if len(cols) < 3:
             continue
- 
+
         texts = [c.get_text(" ", strip=True) for c in cols]
- 
-        # Ищем колонку с номером дела
+
         number = None
-        for t in texts:
+        num_idx = -1
+        for i, t in enumerate(texts):
             if _is_case_number(t):
                 number = t
+                num_idx = i
                 break
- 
+
         if not number:
             continue
- 
-        # Строка должна содержать фамилию искомого человека
+
         row_text = " ".join(texts).lower()
         if search_name_lower not in row_text:
             continue
- 
+
         def safe(i):
             return texts[i].strip() if i < len(texts) and texts[i].strip() else None
- 
-        # Типовой порядок колонок sudrf.ru:
-        # 0: номер дела, 1: дата слушания, 2: категория, 3: стороны, 4: судья, 5: статус
-        # Но номер может быть не в колонке 0, поэтому ищем динамически
-        num_idx = next(i for i, t in enumerate(texts) if _is_case_number(t))
- 
+
         cases.append({
             "number":        number,
             "hearing_date":  safe(num_idx + 1),
@@ -233,18 +212,18 @@ def _extract_sudrf_rows(soup: BeautifulSoup, search_name: str) -> list[dict]:
             "judge":         safe(num_idx + 4),
             "status":        safe(num_idx + 5),
         })
- 
+
     log.info("_extract_sudrf_rows: найдено %d дел для '%s'", len(cases), search_name)
     return cases
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════
 #  ПАРСЕР 2: Мировые судьи СПб (mirsud.spb.ru) — Playwright
 # ══════════════════════════════════════════════════════════════
- 
+
 MIRSUD_URL = "https://mirsud.spb.ru/cases/"
- 
- 
+
+
 async def parse_mirsud(fio: str, birth_year: str) -> list[dict]:
     results = []
     try:
@@ -259,11 +238,11 @@ async def parse_mirsud(fio: str, birth_year: str) -> list[dict]:
                 locale="ru-RU",
             )
             page = await ctx.new_page()
- 
+
             log.info("mirsud.spb.ru => %s ...", fio)
             await page.goto(MIRSUD_URL, wait_until="networkidle", timeout=60_000)
             await asyncio.sleep(2)
- 
+
             for selector in [
                 "text=Гражданские",
                 "[data-type='civil']",
@@ -278,7 +257,7 @@ async def parse_mirsud(fio: str, birth_year: str) -> list[dict]:
                         break
                 except Exception:
                     pass
- 
+
             fio_field = None
             for sel in [
                 "input[name*='fio']",
@@ -295,15 +274,15 @@ async def parse_mirsud(fio: str, birth_year: str) -> list[dict]:
                         break
                 except Exception:
                     pass
- 
+
             if not fio_field:
                 log.error("mirsud: поле ФИО не найдено")
                 await browser.close()
                 return []
- 
+
             await fio_field.triple_click()
             await fio_field.fill(fio)
- 
+
             for sel in [
                 "input[name*='year']", "input[name*='birth']",
                 "input[placeholder*='год']", "input[ng-model*='year']",
@@ -316,7 +295,7 @@ async def parse_mirsud(fio: str, birth_year: str) -> list[dict]:
                         break
                 except Exception:
                     pass
- 
+
             for sel in [
                 "button[type='submit']",
                 "input[type='submit']",
@@ -332,7 +311,7 @@ async def parse_mirsud(fio: str, birth_year: str) -> list[dict]:
                         break
                 except Exception:
                     pass
- 
+
             try:
                 await page.wait_for_selector(
                     "table tr, .result-row, .no-results, [class*='result']",
@@ -340,13 +319,13 @@ async def parse_mirsud(fio: str, birth_year: str) -> list[dict]:
                 )
             except PWTimeout:
                 log.warning("mirsud: таймаут ожидания результатов")
- 
+
             await asyncio.sleep(3)
- 
+
             rows = await page.query_selector_all("table tbody tr")
             if not rows:
                 rows = await page.query_selector_all("tr.case-row, .result-row, table tr")
- 
+
             for row in rows:
                 cols = await row.query_selector_all("td")
                 if len(cols) < 2:
@@ -357,16 +336,16 @@ async def parse_mirsud(fio: str, birth_year: str) -> list[dict]:
                 case = _parse_mirsud_row(texts)
                 if case:
                     results.append(case)
- 
+
             await browser.close()
- 
+
     except Exception as e:
         log.error("mirsud parse error для %s: %s", fio, e, exc_info=True)
- 
+
     log.info("mirsud.spb.ru => %s: найдено %d дел", fio, len(results))
     return results
- 
- 
+
+
 def _parse_mirsud_row(texts: list[str]) -> dict | None:
     number = None
     for t in texts:
@@ -378,10 +357,10 @@ def _parse_mirsud_row(texts: list[str]) -> dict | None:
         if not non_empty:
             return None
         number = non_empty[0]
- 
+
     def safe(i):
         return texts[i] if i < len(texts) else None
- 
+
     return {
         "number":       number,
         "type":         safe(1),
@@ -390,12 +369,12 @@ def _parse_mirsud_row(texts: list[str]) -> dict | None:
         "hearing_date": safe(4),
         "status":       safe(5),
     }
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════
 #  ОТЧЁТ
 # ══════════════════════════════════════════════════════════════
- 
+
 def _format_case(c: dict) -> str:
     lines = ["   📁 <code>" + c["number"] + "</code>"]
     if c.get("type"):          lines.append("      Тип: " + c["type"])
@@ -406,27 +385,27 @@ def _format_case(c: dict) -> str:
     if c.get("hearing_date"):  lines.append("      Дата: " + c["hearing_date"])
     if c.get("status"):        lines.append("      Статус: " + c["status"])
     return "\n".join(lines)
- 
- 
+
+
 async def check_all() -> str:
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
     report_lines = [
         "📋 <b>Ежедневный отчёт по судебным делам</b>",
         "🕐 " + now_str + " МСК\n",
     ]
- 
+
     async with aiohttp.ClientSession() as session:
         for person in PERSONS:
             report_lines.append(
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 + "👤 <b>" + person["fio"] + "</b> (г.р. " + person["birth_year"] + ")\n"
             )
- 
+
             kln_cases = await parse_kalininskiy(
                 person["last_name"], person["birth_year"], session
             )
             kln_new = await save_new_cases(person["id"], "kalininskiy", kln_cases)
- 
+
             report_lines.append("🏛 <b>Калининский районный суд СПб</b>")
             if kln_cases:
                 report_lines.append("   Найдено дел: <b>" + str(len(kln_cases)) + "</b>")
@@ -438,12 +417,12 @@ async def check_all() -> str:
                     report_lines.append(_format_case(c))
             else:
                 report_lines.append("   ✅ Дел не обнаружено")
- 
+
             report_lines.append("")
- 
+
             mir_cases = await parse_mirsud(person["fio"], person["birth_year"])
             mir_new = await save_new_cases(person["id"], "mirsud", mir_cases)
- 
+
             report_lines.append("⚖️ <b>Мировые судьи СПб</b>")
             if mir_cases:
                 report_lines.append("   Найдено дел: <b>" + str(len(mir_cases)) + "</b>")
@@ -455,21 +434,21 @@ async def check_all() -> str:
                     report_lines.append(_format_case(c))
             else:
                 report_lines.append("   ✅ Дел не обнаружено")
- 
+
             report_lines.append("")
- 
+
     report_lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
     report_lines.append("🔄 Следующая проверка завтра в 11:00 МСК")
     return "\n".join(report_lines)
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════
 #  TELEGRAM ХЕНДЛЕРЫ
 # ══════════════════════════════════════════════════════════════
- 
+
 router = Router()
- 
- 
+
+
 @router.message(CommandStart())
 async def cmd_start(msg: Message):
     await msg.answer(
@@ -486,15 +465,15 @@ async def cmd_start(msg: Message):
         "/status — статистика по базе",
         parse_mode="HTML",
     )
- 
- 
+
+
 @router.message(Command("check"))
 async def cmd_check(msg: Message):
     await msg.answer("🔍 Запускаю проверку обоих судов... (~1–2 минуты)")
     report = await check_all()
     await send_long_message(msg.bot, msg.chat.id, report)
- 
- 
+
+
 @router.message(Command("status"))
 async def cmd_status(msg: Message):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -508,7 +487,7 @@ async def cmd_status(msg: Message):
             "SELECT COUNT(*) FROM cases WHERE court_key='mirsud'"
         )
         mir_total = (await cur3.fetchone())[0]
- 
+
     await msg.answer(
         "ℹ️ <b>Статус бота</b>\n\n"
         + "📦 Всего дел в базе: <b>" + str(total) + "</b>\n"
@@ -517,8 +496,8 @@ async def cmd_status(msg: Message):
         + "⏰ Следующий отчёт в <b>11:00 МСК</b>",
         parse_mode="HTML",
     )
- 
- 
+
+
 async def send_long_message(bot: Bot, chat_id, text: str):
     max_len = 4000
     if len(text) <= max_len:
@@ -537,12 +516,12 @@ async def send_long_message(bot: Bot, chat_id, text: str):
     for part in parts:
         await bot.send_message(chat_id, part, parse_mode="HTML")
         await asyncio.sleep(0.3)
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════
 #  ПЛАНИРОВЩИК И ТОЧКА ВХОДА
 # ══════════════════════════════════════════════════════════════
- 
+
 async def scheduled_report(bot: Bot):
     log.info("▶ Ежедневный отчёт запущен")
     try:
@@ -555,15 +534,19 @@ async def scheduled_report(bot: Bot):
             TELEGRAM_CHAT_ID,
             "⚠️ Ошибка при формировании отчёта: " + str(e),
         )
- 
- 
+
+
+async def health_check(request):
+    return web.Response(text="OK")
+
+
 async def main():
     await init_db()
- 
+
     bot = Bot(token=BOT_TOKEN)
     dp  = Dispatcher()
     dp.include_router(router)
- 
+
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(
         scheduled_report, "cron",
@@ -571,14 +554,21 @@ async def main():
         args=[bot],
     )
     scheduler.start()
- 
     log.info(
-        "Бот запущен. Ежедневный отчёт в %02d:%02d МСК => чат %s",
+        "Планировщик запущен. Отчёт в %02d:%02d МСК => чат %s",
         CHECK_HOUR, CHECK_MIN, TELEGRAM_CHAT_ID,
     )
- 
+
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("Health-check сервер запущен на порту %d", PORT)
+
     await dp.start_polling(bot, skip_updates=True)
- 
- 
+
+
 if __name__ == "__main__":
     asyncio.run(main())
