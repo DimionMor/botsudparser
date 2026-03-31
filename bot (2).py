@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import re
+import pytz
 from datetime import datetime
 
 import aiosqlite
@@ -21,16 +22,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-# ══════════════════════════════════════════════════════════════
-#  КОНФИГУРАЦИЯ
-# ══════════════════════════════════════════════════════════════
-
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 PORT             = int(os.getenv("PORT", 8080))
 
 DB_PATH    = "court_monitor.db"
-CHECK_HOUR = 11   # МСК
+CHECK_HOUR = 11
 CHECK_MIN  = 0
 
 PERSONS = [
@@ -58,10 +55,6 @@ log = logging.getLogger(__name__)
 
 CASE_NUMBER_RE = re.compile(r"^\d{1,5}[а-яА-Я]?[-\u2011]\d{1,6}/\d{2,4}$")
 
-
-# ══════════════════════════════════════════════════════════════
-#  БАЗА ДАННЫХ
-# ══════════════════════════════════════════════════════════════
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -108,10 +101,6 @@ async def save_new_cases(person_id: int, court_key: str, cases: list[dict]) -> l
         await db.commit()
     return new_cases
 
-
-# ══════════════════════════════════════════════════════════════
-#  ПАРСЕР 1: Калининский районный суд (kln--spb.sudrf.ru)
-# ══════════════════════════════════════════════════════════════
 
 KLN_BASE = "https://kln--spb.sudrf.ru/modules.php"
 
@@ -216,10 +205,6 @@ def _extract_sudrf_rows(soup: BeautifulSoup, search_name: str) -> list[dict]:
     log.info("_extract_sudrf_rows: найдено %d дел для '%s'", len(cases), search_name)
     return cases
 
-
-# ══════════════════════════════════════════════════════════════
-#  ПАРСЕР 2: Мировые судьи СПб (mirsud.spb.ru) — Playwright
-# ══════════════════════════════════════════════════════════════
 
 MIRSUD_URL = "https://mirsud.spb.ru/cases/"
 
@@ -371,10 +356,6 @@ def _parse_mirsud_row(texts: list[str]) -> dict | None:
     }
 
 
-# ══════════════════════════════════════════════════════════════
-#  ОТЧЁТ
-# ══════════════════════════════════════════════════════════════
-
 def _format_case(c: dict) -> str:
     lines = ["   📁 <code>" + c["number"] + "</code>"]
     if c.get("type"):          lines.append("      Тип: " + c["type"])
@@ -388,7 +369,8 @@ def _format_case(c: dict) -> str:
 
 
 async def check_all() -> str:
-    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    now_msk = datetime.now(pytz.timezone("Europe/Moscow"))
+    now_str = now_msk.strftime("%d.%m.%Y %H:%M")
     report_lines = [
         "📋 <b>Ежедневный отчёт по судебным делам</b>",
         "🕐 " + now_str + " МСК\n",
@@ -441,10 +423,6 @@ async def check_all() -> str:
     report_lines.append("🔄 Следующая проверка завтра в 11:00 МСК")
     return "\n".join(report_lines)
 
-
-# ══════════════════════════════════════════════════════════════
-#  TELEGRAM ХЕНДЛЕРЫ
-# ══════════════════════════════════════════════════════════════
 
 router = Router()
 
@@ -518,10 +496,6 @@ async def send_long_message(bot: Bot, chat_id, text: str):
         await asyncio.sleep(0.3)
 
 
-# ══════════════════════════════════════════════════════════════
-#  ПЛАНИРОВЩИК И ТОЧКА ВХОДА
-# ══════════════════════════════════════════════════════════════
-
 async def scheduled_report(bot: Bot):
     log.info("▶ Ежедневный отчёт запущен")
     try:
@@ -567,8 +541,19 @@ async def main():
     await site.start()
     log.info("Health-check сервер запущен на порту %d", PORT)
 
+    # Если запуск после 11:00 МСК — отправить отчёт сразу
+    now_msk = datetime.now(pytz.timezone("Europe/Moscow"))
+    if now_msk.hour >= CHECK_HOUR:
+        log.info("Запуск после времени отчёта — отправляю сразу")
+        asyncio.create_task(scheduled_report(bot))
+
     await dp.start_polling(bot, skip_updates=True)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
+
+И обновите `requirements.txt` — добавьте строку:
+```
+pytz==2024.1
